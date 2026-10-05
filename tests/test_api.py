@@ -211,3 +211,89 @@ def test_predict_reject_different_crs(client, temp_dir):
     finally:
         for fh in file_handles:
             fh.close()
+
+
+def test_predict_all_download_assets(client, temp_dir):
+    """8. Test that predict endpoint generates super_resolved.png, uncertainty_map.png, and mfsr_results.zip."""
+    import zipfile
+    files_to_upload = []
+    file_handles = []
+
+    for i in range(8):
+        path = os.path.join(temp_dir, f"frame_{i + 1}.tif")
+        create_synthetic_geotiff(path, num_channels=17, height=16, width=16)
+        fh = open(path, "rb")
+        file_handles.append(fh)
+        files_to_upload.append(("files", (f"frame_{i + 1}.tif", fh, "image/tiff")))
+
+    try:
+        response = client.post(
+            "/api/v1/predict",
+            files=files_to_upload,
+            data={"target_height": "32", "target_width": "32"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        files_dict = data["files"]
+
+        # Check PNG downloads
+        sr_png_url = files_dict["super_resolved_png"]
+        sr_png_resp = client.get(sr_png_url)
+        assert sr_png_resp.status_code == 200
+        assert "image/png" in sr_png_resp.headers["content-type"]
+
+        uq_png_url = files_dict["uncertainty_map_png"]
+        uq_png_resp = client.get(uq_png_url)
+        assert uq_png_resp.status_code == 200
+        assert "image/png" in uq_png_resp.headers["content-type"]
+
+        # Check ZIP download
+        zip_url = files_dict["zip_archive"]
+        zip_resp = client.get(zip_url)
+        assert zip_resp.status_code == 200
+        assert "application/zip" in zip_resp.headers["content-type"]
+        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as z:
+            names = z.namelist()
+            assert "super_resolved.tif" in names
+            assert "super_resolved.png" in names
+            assert "uncertainty_map.tif" in names
+            assert "uncertainty_map.png" in names
+            assert "metadata.json" in names
+    finally:
+        for fh in file_handles:
+            fh.close()
+
+
+def test_predict_zip_stream_endpoint(client, temp_dir):
+    """9. Test POST /api/v1/predict/zip direct ZIP stream endpoint."""
+    import zipfile
+    files_to_upload = []
+    file_handles = []
+
+    for i in range(8):
+        path = os.path.join(temp_dir, f"frame_{i + 1}.tif")
+        create_synthetic_geotiff(path, num_channels=17, height=16, width=16)
+        fh = open(path, "rb")
+        file_handles.append(fh)
+        files_to_upload.append(("files", (f"frame_{i + 1}.tif", fh, "image/tiff")))
+
+    try:
+        response = client.post(
+            "/api/v1/predict/zip",
+            files=files_to_upload,
+            data={"target_height": "32", "target_width": "32"},
+        )
+        assert response.status_code == 200
+        assert "application/zip" in response.headers["content-type"]
+        assert "attachment" in response.headers.get("content-disposition", "")
+
+        with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+            names = z.namelist()
+            assert "super_resolved.tif" in names
+            assert "super_resolved.png" in names
+            assert "uncertainty_map.tif" in names
+            assert "uncertainty_map.png" in names
+            assert "metadata.json" in names
+    finally:
+        for fh in file_handles:
+            fh.close()

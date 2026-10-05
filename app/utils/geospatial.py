@@ -2,9 +2,13 @@
 Geospatial utilities for reading raster metadata and generating geospatially aligned GeoTIFFs.
 """
 
+import json
 import os
 from typing import Any, Optional, Tuple
+import zipfile
 import numpy as np
+from PIL import Image
+import matplotlib.cm as cm
 import rasterio
 from rasterio.transform import Affine, from_bounds
 from rasterio.crs import CRS
@@ -149,3 +153,89 @@ def save_geotiff(
                 dst.set_band_description(idx, desc)
 
     return os.path.abspath(output_path)
+
+
+def save_rgb_png(
+    output_path: str,
+    data: np.ndarray,
+    rgb_indices: Tuple[int, int, int] = (0, 1, 2),
+) -> str:
+    """
+    Renders an RGB PNG visualization from super-resolved multi-band data [C, H, W]
+    using standard 2%-98% percentile contrast stretching.
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    if data.ndim == 2:
+        # Grayscale single band
+        gray = np.nan_to_num(data, nan=0.0).astype(np.float32)
+        p2, p98 = np.percentile(gray, (2, 98))
+        norm = np.clip((gray - p2) / (p98 - p2 + 1e-7), 0.0, 1.0)
+        rgb_uint8 = np.stack([(norm * 255.0).astype(np.uint8)] * 3, axis=-1)
+    else:
+        # Select RGB bands
+        max_idx = data.shape[0] - 1
+        r_idx = min(rgb_indices[0], max_idx)
+        g_idx = min(rgb_indices[1], max_idx)
+        b_idx = min(rgb_indices[2], max_idx)
+        
+        rgb = np.stack([data[r_idx], data[g_idx], data[b_idx]], axis=-1)
+        rgb = np.nan_to_num(rgb, nan=0.0).astype(np.float32)
+        
+        p2, p98 = np.percentile(rgb, (2, 98))
+        norm = np.clip((rgb - p2) / (p98 - p2 + 1e-7), 0.0, 1.0)
+        rgb_uint8 = (norm * 255.0).astype(np.uint8)
+
+    img = Image.fromarray(rgb_uint8, mode="RGB")
+    img.save(output_path, format="PNG")
+    return os.path.abspath(output_path)
+
+
+def save_uncertainty_png(
+    output_path: str,
+    data: np.ndarray,
+    cmap_name: str = "inferno",
+) -> str:
+    """
+    Renders an uncertainty map [H, W] to an RGB PNG visualization using a perceptual colormap.
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    u_data = np.nan_to_num(data, nan=0.0).astype(np.float32)
+    p1, p99 = np.percentile(u_data, (1, 99))
+    if p99 > p1:
+        norm = np.clip((u_data - p1) / (p99 - p1), 0.0, 1.0)
+    else:
+        norm = np.zeros_like(u_data)
+
+    try:
+        import matplotlib
+        colormap = matplotlib.colormaps[cmap_name]
+    except (AttributeError, KeyError):
+        colormap = cm.get_cmap(cmap_name)
+    colored_rgba = colormap(norm)  # [H, W, 4] float in [0, 1]
+    colored_rgb = (colored_rgba[..., :3] * 255.0).astype(np.uint8)
+
+    img = Image.fromarray(colored_rgb, mode="RGB")
+    img.save(output_path, format="PNG")
+    return os.path.abspath(output_path)
+
+
+def create_results_zip(
+    output_zip_path: str,
+    file_map: dict[str, str],
+    metadata: Optional[dict[str, Any]] = None,
+) -> str:
+    """
+    Packages generated GeoTIFFs, PNGs, and JSON metadata into a single zip archive.
+    """
+    os.makedirs(os.path.dirname(output_zip_path), exist_ok=True)
+    with zipfile.ZipFile(output_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        for arcname, filepath in file_map.items():
+            if os.path.isfile(filepath):
+                zipf.write(filepath, arcname=arcname)
+        if metadata is not None:
+            metadata_str = json.dumps(metadata, indent=2, default=str)
+            zipf.writestr("metadata.json", metadata_str)
+
+    return os.path.abspath(output_zip_path)

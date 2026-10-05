@@ -139,6 +139,7 @@ async def root():
         "docs_url": "/docs",
         "health_url": "/health",
         "predict_endpoint": "/api/v1/predict",
+        "predict_zip_endpoint": "/api/v1/predict/zip",
     }
 
 
