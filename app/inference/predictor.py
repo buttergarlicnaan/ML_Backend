@@ -1,7 +1,5 @@
 """
 Inference predictor module for the MFSR Model.
-Manages the loaded model instance, runs GPU/CPU inference, computes uncertainty metrics,
-and writes out geospatially aligned GeoTIFF files.
 """
 
 import logging
@@ -18,17 +16,15 @@ from app.utils.geospatial import (
     GeospatialMetadata,
     compute_upscaled_transform,
     save_geotiff,
+    save_rgb_png,
+    save_uncertainty_png,
+    create_results_zip,
 )
 
 logger = logging.getLogger(__name__)
 
 
 class MFSRPredictor:
-    """
-    Singleton-style predictor holder for the MFSR model.
-    Loads once on startup and handles inference requests.
-    """
-
     def __init__(self):
         self.model: Optional[MFSR_Network] = None
         self.device: Optional[torch.device] = None
@@ -42,9 +38,6 @@ class MFSRPredictor:
         feat_channels: int = 64,
         out_channels: Optional[int] = None,
     ) -> None:
-        """
-        Loads the MFSR model from checkpoint. Called once on FastAPI startup.
-        """
         ckpt_path = checkpoint_path or settings.MODEL_CHECKPOINT
         dev_str = device_name or settings.DEVICE
         self.device = get_device(dev_str)
@@ -66,10 +59,6 @@ class MFSRPredictor:
         target_width: Optional[int] = None,
         scale_factor: Optional[float] = None,
     ) -> Tuple[int, int]:
-        """
-        Determines the target HR spatial dimensions.
-        Prefers explicit dimensions if provided; otherwise applies the scale factor.
-        """
         if target_height is not None and target_width is not None:
             return int(target_height), int(target_width)
 
@@ -87,20 +76,6 @@ class MFSRPredictor:
         target_width: Optional[int] = None,
         scale_factor: Optional[float] = None,
     ) -> dict[str, Any]:
-        """
-        Runs inference on the preprocessed [1, 8, 17, H, W] tensor and writes GeoTIFF outputs.
-
-        Args:
-            input_tensor: [1, 8, 17, H, W] PyTorch tensor
-            ref_geospatial: GeospatialMetadata of the reference frame
-            request_id: Unique request identifier
-            target_height: Optional explicit HR height
-            target_width: Optional explicit HR width
-            scale_factor: Optional custom upscaling factor
-
-        Returns:
-            Dictionary with prediction shapes, uncertainty stats, file paths, and geospatial info.
-        """
         if not self.is_loaded or self.model is None:
             raise RuntimeError("MFSR Model is not loaded. Call predictor.load() before predict().")
 
@@ -110,7 +85,6 @@ class MFSRPredictor:
 
         _, T, C, lr_h, lr_w = input_tensor.shape
 
-        # Calculate target HR size
         hr_h, hr_w = self.calculate_target_size(
             lr_height=lr_h,
             lr_width=lr_w,
@@ -124,30 +98,23 @@ class MFSRPredictor:
             f"on {self.device}"
         )
 
-        # Move tensor to device (using non_blocking transfer if GPU)
         device_tensor = input_tensor.to(
             self.device,
             non_blocking=(self.device.type == "cuda"),
         )
 
-        # Execute model forward pass
         with torch.inference_mode():
             y_pred, uncertainty = self.model(device_tensor, target_size=(hr_h, hr_w))
 
-        # Transfer back to CPU as NumPy arrays
-        # y_pred: [1, out_channels, hr_h, hr_w] -> [out_channels, hr_h, hr_w]
         y_pred_np = y_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
-        # uncertainty: [1, 1, hr_h, hr_w] -> [hr_h, hr_w]
         uncertainty_np = uncertainty.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
 
         out_channels = y_pred_np.shape[0]
 
-        # Uncertainty metrics
         u_min = float(np.min(uncertainty_np))
         u_max = float(np.max(uncertainty_np))
         u_mean = float(np.mean(uncertainty_np))
 
-        # Compute updated Affine transform for the HR grid
         hr_transform = compute_upscaled_transform(
             lr_transform=ref_geospatial.transform,
             lr_width=lr_w,
@@ -157,7 +124,6 @@ class MFSRPredictor:
             bounds=ref_geospatial.bounds,
         )
 
-        # Band descriptions for super-resolved GeoTIFF
         if out_channels == 4:
             descriptions = ["Red", "Green", "Blue", "NIR"]
         elif out_channels == 12:
@@ -165,7 +131,6 @@ class MFSRPredictor:
         else:
             descriptions = [f"Channel_{i + 1}" for i in range(out_channels)]
 
-        # Save Super-Resolved Multi-band GeoTIFF
         sr_filename = "super_resolved.tif"
         sr_path = os.path.join(req_out_dir, sr_filename)
         save_geotiff(
@@ -176,7 +141,15 @@ class MFSRPredictor:
             descriptions=descriptions,
         )
 
-        # Save Uncertainty Map Single-band GeoTIFF
+        rgb_indices = (3, 2, 1) if out_channels >= 12 else (0, 1, 2)
+        sr_png_filename = "super_resolved.png"
+        sr_png_path = os.path.join(req_out_dir, sr_png_filename)
+        save_rgb_png(
+            output_path=sr_png_path,
+            data=y_pred_np,
+            rgb_indices=rgb_indices,
+        )
+
         uq_filename = "uncertainty_map.tif"
         uq_path = os.path.join(req_out_dir, uq_filename)
         save_geotiff(
@@ -187,10 +160,44 @@ class MFSRPredictor:
             descriptions=["Uncertainty_Variance_SigmaSq"],
         )
 
+        uq_png_filename = "uncertainty_map.png"
+        uq_png_path = os.path.join(req_out_dir, uq_png_filename)
+        save_uncertainty_png(
+            output_path=uq_png_path,
+            data=uncertainty_np,
+            cmap_name="inferno",
+        )
+
+        zip_filename = "mfsr_results.zip"
+        zip_path = os.path.join(req_out_dir, zip_filename)
+        metadata_dict = {
+            "request_id": req_id,
+            "scale_factor": scale_factor or settings.DEFAULT_SCALE_FACTOR,
+            "input_shape": [T, C, lr_h, lr_w],
+            "output_shape": [out_channels, hr_h, hr_w],
+            "band_descriptions": descriptions,
+            "uncertainty_stats": {
+                "min": u_min,
+                "max": u_max,
+                "mean": u_mean,
+            },
+            "crs": str(ref_geospatial.crs) if ref_geospatial.crs else None,
+        }
+        create_results_zip(
+            output_zip_path=zip_path,
+            file_map={
+                "super_resolved.tif": sr_path,
+                "super_resolved.png": sr_png_path,
+                "uncertainty_map.tif": uq_path,
+                "uncertainty_map.png": uq_png_path,
+            },
+            metadata=metadata_dict,
+        )
+
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
-        logger.info(f"[{req_id}] Inference and GeoTIFF export completed successfully.")
+        logger.info(f"[{req_id}] Inference, GeoTIFF, PNG, and ZIP export completed successfully.")
 
         return {
             "request_id": req_id,
@@ -213,9 +220,19 @@ class MFSRPredictor:
             "files": {
                 "super_resolved": f"/api/v1/download/{req_id}/{sr_filename}",
                 "uncertainty_map": f"/api/v1/download/{req_id}/{uq_filename}",
+                "super_resolved_tif": f"/api/v1/download/{req_id}/{sr_filename}",
+                "super_resolved_png": f"/api/v1/download/{req_id}/{sr_png_filename}",
+                "uncertainty_map_tif": f"/api/v1/download/{req_id}/{uq_filename}",
+                "uncertainty_map_png": f"/api/v1/download/{req_id}/{uq_png_filename}",
+                "zip_archive": f"/api/v1/download/{req_id}/{zip_filename}",
                 "local_paths": {
                     "super_resolved": sr_path,
                     "uncertainty_map": uq_path,
+                    "super_resolved_tif": sr_path,
+                    "super_resolved_png": sr_png_path,
+                    "uncertainty_map_tif": uq_path,
+                    "uncertainty_map_png": uq_png_path,
+                    "zip_archive": zip_path,
                 },
             },
             "device": str(self.device),

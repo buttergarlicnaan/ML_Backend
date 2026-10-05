@@ -1,5 +1,6 @@
 """
-Geospatial utilities for reading raster metadata and generating geospatially aligned GeoTIFFs.
+Geospatial utilities for reading raster metadata and generating geospatially aligned GeoTIFFs,
+RGB visual previews, and ZIP archives.
 """
 
 import json
@@ -49,9 +50,6 @@ class GeospatialMetadata:
 
 
 def read_geospatial_metadata(tiff_path: str) -> GeospatialMetadata:
-    """
-    Reads CRS, Affine transform, dimensions, and bounding box from a GeoTIFF.
-    """
     with rasterio.open(tiff_path) as src:
         return GeospatialMetadata(
             crs=src.crs,
@@ -72,12 +70,7 @@ def compute_upscaled_transform(
     hr_height: int,
     bounds: Optional[Any] = None,
 ) -> Affine:
-    """
-    Computes the scaled affine transform so that the high-resolution output
-    preserves exact geospatial bounding box and alignment.
-    """
     if bounds is not None and bounds.left is not None:
-        # Use rasterio from_bounds for exact bounding box preservation
         return from_bounds(
             bounds.left,
             bounds.bottom,
@@ -86,8 +79,6 @@ def compute_upscaled_transform(
             hr_width,
             hr_height,
         )
-
-    # Scale transform using pixel size ratios: dx_hr = dx_lr * (W_lr / W_hr)
     scale_x = float(lr_width) / float(hr_width)
     scale_y = float(lr_height) / float(hr_height)
     return lr_transform * Affine.scale(scale_x, scale_y)
@@ -101,30 +92,14 @@ def save_geotiff(
     nodata: Optional[float] = None,
     descriptions: Optional[list[str]] = None,
 ) -> str:
-    """
-    Writes a NumPy array to a GeoTIFF file.
-
-    Args:
-        output_path: Destination file path
-        data: Array of shape [channels, height, width] or [height, width]
-        crs: Coordinate Reference System
-        transform: Updated Affine transform
-        nodata: Optional NoData value
-        descriptions: Optional list of band description strings
-
-    Returns:
-        Absolute output file path
-    """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     if data.ndim == 2:
-        # Single band: [height, width] -> [1, height, width]
         count = 1
         height, width = data.shape
         write_data = data[np.newaxis, :, :]
     elif data.ndim == 3:
         if data.shape[0] > data.shape[2] and data.shape[2] <= 16:
-            # If passed as [height, width, channels], transpose to [channels, height, width]
             write_data = np.transpose(data, (2, 0, 1))
         else:
             write_data = data
@@ -160,28 +135,22 @@ def save_rgb_png(
     data: np.ndarray,
     rgb_indices: Tuple[int, int, int] = (0, 1, 2),
 ) -> str:
-    """
-    Renders an RGB PNG visualization from super-resolved multi-band data [C, H, W]
-    using standard 2%-98% percentile contrast stretching.
-    """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+
     if data.ndim == 2:
-        # Grayscale single band
         gray = np.nan_to_num(data, nan=0.0).astype(np.float32)
         p2, p98 = np.percentile(gray, (2, 98))
         norm = np.clip((gray - p2) / (p98 - p2 + 1e-7), 0.0, 1.0)
         rgb_uint8 = np.stack([(norm * 255.0).astype(np.uint8)] * 3, axis=-1)
     else:
-        # Select RGB bands
         max_idx = data.shape[0] - 1
         r_idx = min(rgb_indices[0], max_idx)
         g_idx = min(rgb_indices[1], max_idx)
         b_idx = min(rgb_indices[2], max_idx)
-        
+
         rgb = np.stack([data[r_idx], data[g_idx], data[b_idx]], axis=-1)
         rgb = np.nan_to_num(rgb, nan=0.0).astype(np.float32)
-        
+
         p2, p98 = np.percentile(rgb, (2, 98))
         norm = np.clip((rgb - p2) / (p98 - p2 + 1e-7), 0.0, 1.0)
         rgb_uint8 = (norm * 255.0).astype(np.uint8)
@@ -196,11 +165,8 @@ def save_uncertainty_png(
     data: np.ndarray,
     cmap_name: str = "inferno",
 ) -> str:
-    """
-    Renders an uncertainty map [H, W] to an RGB PNG visualization using a perceptual colormap.
-    """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+
     u_data = np.nan_to_num(data, nan=0.0).astype(np.float32)
     p1, p99 = np.percentile(u_data, (1, 99))
     if p99 > p1:
@@ -213,7 +179,8 @@ def save_uncertainty_png(
         colormap = matplotlib.colormaps[cmap_name]
     except (AttributeError, KeyError):
         colormap = cm.get_cmap(cmap_name)
-    colored_rgba = colormap(norm)  # [H, W, 4] float in [0, 1]
+
+    colored_rgba = colormap(norm)
     colored_rgb = (colored_rgba[..., :3] * 255.0).astype(np.uint8)
 
     img = Image.fromarray(colored_rgb, mode="RGB")
@@ -226,9 +193,6 @@ def create_results_zip(
     file_map: dict[str, str],
     metadata: Optional[dict[str, Any]] = None,
 ) -> str:
-    """
-    Packages generated GeoTIFFs, PNGs, and JSON metadata into a single zip archive.
-    """
     os.makedirs(os.path.dirname(output_zip_path), exist_ok=True)
     with zipfile.ZipFile(output_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
         for arcname, filepath in file_map.items():

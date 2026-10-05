@@ -7,3 +7,4 @@ outputs/
 .env
 .vscode
 .env.example
+worldstrat-data-preprocessing.ipynb

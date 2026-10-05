@@ -67,3 +67,62 @@ def test_nan_inf_cleaning(temp_dir):
     frame = process_single_frame(path, frame_idx=1)
     assert not torch.isnan(torch.from_numpy(frame)).any()
     assert not torch.isinf(torch.from_numpy(frame)).any()
+
+
+def test_worldstrat_notebook_preprocessing_components():
+    """Verify specific components from worldstrat-data-preprocessing(1).ipynb."""
+    from app.preprocessing.tif_preprocessor import (
+        normalize_reflectance,
+        process_validity_mask,
+        normalize_angles,
+        standardize_shape,
+        safe_load_angle,
+    )
+    import numpy as np
+
+    # 1. Test normalize_reflectance: WorldStrat clipping to [0.0, 2.0]
+    raw_l2a = np.array([[[ -0.5, 0.5, 2.5 ]]], dtype=np.float32)
+    norm_l2a = normalize_reflectance(raw_l2a)
+    assert norm_l2a.min() == 0.0
+    assert norm_l2a.max() == 2.0
+
+    # 2. Test raw 16-bit DN scaling
+    raw_dn = np.array([[[ 5000.0, 10000.0, 15000.0 ]]], dtype=np.float32)
+    norm_dn = normalize_reflectance(raw_dn)
+    assert norm_dn[0, 0, 0] == 0.5
+    assert norm_dn[0, 0, 1] == 1.0
+    assert norm_dn[0, 0, 2] == 1.5
+
+    # 3. Test standardize_shape
+    arr_2d = np.ones((16, 16), dtype=np.float32)
+    assert standardize_shape(arr_2d).shape == (1, 16, 16)
+    arr_3d = np.ones((16, 16, 12), dtype=np.float32)
+    assert standardize_shape(arr_3d).shape == (12, 16, 16)
+
+    # 4. Test process_validity_mask with cloud probability (CLP < 50)
+    clp = np.array([[10.0, 60.0]], dtype=np.float32)
+    mask = process_validity_mask(clp_data=clp, target_hw=(1, 2))
+    assert mask[0, 0, 0] == 1.0  # valid (<50)
+    assert mask[0, 0, 1] == 0.0  # invalid (>50)
+
+    # 5. Test mask safety net (all black -> forced all white)
+    clp_all_cloud = np.full((1, 4, 4), 99.0, dtype=np.float32)
+    safe_mask = process_validity_mask(clp_data=clp_all_cloud, target_hw=(4, 4))
+    assert (safe_mask == 1.0).all()
+
+    # 6. Test normalize_angles (Sun Az / 360, Sun Zen / 180, View Az / 360, View Zen / 180)
+    sun_az = np.array([[[180.0]]], dtype=np.float32)
+    sun_zen = np.array([[[90.0]]], dtype=np.float32)
+    view_az = np.array([[[360.0]]], dtype=np.float32)
+    view_zen = np.array([[[0.0]]], dtype=np.float32)
+    angles = normalize_angles(sun_az, sun_zen, view_az, view_zen)
+    assert angles.shape == (4, 1, 1)
+    assert np.isclose(angles[0, 0, 0], 0.5)   # 180/360
+    assert np.isclose(angles[1, 0, 0], 0.5)   # 90/180
+    assert np.isclose(angles[2, 0, 0], 1.0)   # 360/360
+    assert np.isclose(angles[3, 0, 0], 0.0)   # 0/180
+
+    # 7. Test safe_load_angle fallback (missing file -> 0.5)
+    fallback_angle = safe_load_angle(None, 360.0, (8, 8))
+    assert fallback_angle.shape == (1, 8, 8)
+    assert (fallback_angle == 0.5).all()

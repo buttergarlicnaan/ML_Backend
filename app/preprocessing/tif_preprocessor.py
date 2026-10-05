@@ -1,13 +1,14 @@
 """
 TIFF Preprocessor for Multi-Frame Super-Resolution (MFSR).
-
-Loads 8 temporal GeoTIFF files, validates them, normalizes Sentinel-2 reflectance,
-constructs the exact 17-channel representation, and outputs a PyTorch tensor
-of shape [1, 8, 17, H, W].
+Incorporates the complete WorldStrat data preprocessing pipeline from
+worldstrat-data-preprocessing(1).ipynb.
 """
 
+from collections import defaultdict
 import logging
-from typing import Any, List, Optional, Tuple
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple, Union
 from fastapi import HTTPException
 import numpy as np
 import rasterio
@@ -27,103 +28,210 @@ from app.utils.validation import validate_spatial_consistency
 logger = logging.getLogger(__name__)
 
 
-def process_single_frame(
-    tiff_path: str,
-    frame_idx: int,
-    allow_synthetic: bool = False,
+def load_raster(file_path: str) -> np.ndarray:
+    with rasterio.open(file_path) as src:
+        data = src.read()
+    data = np.nan_to_num(data.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    return data
+
+
+def normalize_reflectance(l2a_data: np.ndarray, divisor: float = 10000.0) -> np.ndarray:
+    data = np.nan_to_num(l2a_data.astype(np.float32), nan=0.0, posinf=2.0, neginf=0.0)
+    if data.max() > 10.0:
+        return np.clip(data / divisor, 0.0, 2.0)
+    return np.clip(data, 0.0, 2.0)
+
+
+def standardize_shape(arr: np.ndarray) -> np.ndarray:
+    if arr.ndim == 2:
+        return arr[np.newaxis, :, :]
+    elif arr.ndim == 3 and arr.shape[2] == 12 and arr.shape[0] != 12:
+        return np.transpose(arr, (2, 0, 1))
+    return arr
+
+
+def process_validity_mask(
+    clm_data: Optional[np.ndarray] = None,
+    clp_data: Optional[np.ndarray] = None,
+    datamask: Optional[np.ndarray] = None,
+    target_hw: Tuple[int, int] = (16, 16),
 ) -> np.ndarray:
-    """
-    Reads a single GeoTIFF, validates channel counts, performs Sentinel-2 normalization,
-    and formats into exactly 17 channels [17, H, W].
+    H, W = target_hw
 
-    Args:
-        tiff_path: Path to the GeoTIFF file
-        frame_idx: 1-indexed temporal frame number
-        allow_synthetic: If True, permits synthesizing missing mask/angles for testing
+    if clp_data is not None:
+        clp = standardize_shape(clp_data)
+        validity_mask = (clp < 50.0).astype(np.float32)
+    elif datamask is not None:
+        mask = standardize_shape(datamask).astype(np.float32)
+        if mask.max() > 1.0:
+            validity_mask = (mask > 0).astype(np.float32)
+        else:
+            validity_mask = np.clip(mask, 0.0, 1.0)
+    elif clm_data is not None:
+        clm = standardize_shape(clm_data)
+        validity_mask = (clm == 0).astype(np.float32)
+    else:
+        validity_mask = np.ones((1, H, W), dtype=np.float32)
 
-    Returns:
-        np.ndarray of shape [17, H, W], dtype float32
-    """
-    with rasterio.open(tiff_path) as src:
-        num_channels = src.count
-        height = src.height
-        width = src.width
-        raw_data = src.read()  # [C, H, W]
+    if np.max(validity_mask) == 0.0:
+        validity_mask = np.ones((1, H, W), dtype=np.float32)
 
-    # Clean NaN / Inf values immediately
-    data = np.nan_to_num(raw_data.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    return validity_mask
 
-    # ------------------------------------------------------------------
-    # Channel count validation and 17-channel tensor construction
-    # ------------------------------------------------------------------
+
+def normalize_angles(
+    sun_az: np.ndarray,
+    sun_zen: np.ndarray,
+    view_az: np.ndarray,
+    view_zen: np.ndarray,
+) -> np.ndarray:
+    sun_az_norm = np.clip(sun_az / 360.0 if sun_az.max() > 1.0 else sun_az, 0.0, 1.0)
+    sun_zen_norm = np.clip(sun_zen / 180.0 if sun_zen.max() > 1.0 else sun_zen, 0.0, 1.0)
+    view_az_norm = np.clip(view_az / 360.0 if view_az.max() > 1.0 else view_az, 0.0, 1.0)
+    view_zen_norm = np.clip(view_zen / 180.0 if view_zen.max() > 1.0 else view_zen, 0.0, 1.0)
+
+    return np.concatenate([sun_az_norm, sun_zen_norm, view_az_norm, view_zen_norm], axis=0)
+
+
+def safe_load_angle(
+    file_path: Optional[str],
+    denominator: float,
+    target_hw: Tuple[int, int],
+) -> np.ndarray:
+    if file_path and os.path.exists(file_path):
+        raster = load_raster(file_path)
+        std_raster = standardize_shape(raster)
+        if std_raster.max() > 1.0:
+            return np.clip(std_raster / denominator, 0.0, 1.0)
+        return np.clip(std_raster, 0.0, 1.0)
+
+    H, W = target_hw
+    return np.full((1, H, W), 0.5, dtype=np.float32)
+
+
+def group_files_by_frame(folder_or_files: Union[str, List[str]]) -> List[Dict[str, str]]:
+    if isinstance(folder_or_files, str) and os.path.isdir(folder_or_files):
+        filenames = os.listdir(folder_or_files)
+        dir_path = folder_or_files
+        full_paths = [os.path.join(dir_path, f) for f in filenames]
+    else:
+        full_paths = list(folder_or_files)
+
+    frames = defaultdict(dict)
+    regex = re.compile(r'-(\d+)-([A-Za-z0-9_]+)\.(?:tiff|tif)$', re.IGNORECASE)
+
+    for filepath in full_paths:
+        filename = os.path.basename(filepath)
+        match = regex.search(filename)
+        if match:
+            frame_idx = int(match.group(1))
+            param_name = match.group(2)
+
+            if param_name == 'L2A_data':
+                frames[frame_idx]['L2A'] = filepath
+            elif param_name == 'dataMask':
+                frames[frame_idx]['dataMask'] = filepath
+            elif param_name == 'CLM':
+                frames[frame_idx]['CLM'] = filepath
+            elif param_name == 'CLP':
+                frames[frame_idx]['CLP'] = filepath
+            elif param_name == 'sunAzimuthAngles':
+                frames[frame_idx]['sunAzimuth'] = filepath
+            elif param_name == 'sunZenithAngles':
+                frames[frame_idx]['sunZenith'] = filepath
+            elif param_name == 'viewAzimuthMean':
+                frames[frame_idx]['viewAzimuth'] = filepath
+            elif param_name == 'viewZenithMean':
+                frames[frame_idx]['viewZenith'] = filepath
+
+    valid_frames = []
+    for frame_idx in sorted(frames.keys()):
+        frame_files = frames[frame_idx]
+        if 'L2A' in frame_files:
+            valid_frames.append(frame_files)
+
+    return valid_frames
+
+
+def process_single_frame(
+    source: Union[str, Dict[str, str]],
+    frame_idx: int = 1,
+    allow_synthetic: bool = True,
+) -> np.ndarray:
+    if isinstance(source, dict):
+        l2a_raw = load_raster(source['L2A'])
+        l2a = standardize_shape(normalize_reflectance(l2a_raw))
+        H, W = l2a.shape[1], l2a.shape[2]
+
+        datamask_raw = load_raster(source['dataMask']) if 'dataMask' in source else None
+        clp_raw = load_raster(source['CLP']) if 'CLP' in source else None
+        clm_raw = load_raster(source['CLM']) if 'CLM' in source else None
+        valid_mask = process_validity_mask(clm_raw, clp_raw, datamask_raw, target_hw=(H, W))
+
+        sun_az = safe_load_angle(source.get('sunAzimuth'), 360.0, (H, W))
+        sun_zen = safe_load_angle(source.get('sunZenith'), 180.0, (H, W))
+        view_az = safe_load_angle(source.get('viewAzimuth'), 360.0, (H, W))
+        view_zen = safe_load_angle(source.get('viewZenith'), 180.0, (H, W))
+
+        return np.concatenate([l2a, valid_mask, sun_az, sun_zen, view_az, view_zen], axis=0).astype(np.float32)
+
+    raw_data = load_raster(source)
+    raw_data = standardize_shape(raw_data)
+    num_channels, H, W = raw_data.shape
+
     if num_channels == EXPECTED_NUM_CHANNELS:
-        # Exactly 17 channels:
-        # [0:12] = 12 reflectance bands
-        # [12:13] = 1 valid/cloud mask
-        # [13:17] = 4 angle channels
-        channels_17 = data
+        ref = normalize_reflectance(raw_data[0:12])
+        mask = process_validity_mask(datamask=raw_data[12:13], target_hw=(H, W))
+
+        angles_raw = raw_data[13:17]
+        sun_az = angles_raw[0:1]
+        sun_zen = angles_raw[1:2]
+        view_az = angles_raw[2:3]
+        view_zen = angles_raw[3:4]
+        angles = normalize_angles(sun_az, sun_zen, view_az, view_zen)
+
+        channels_17 = np.concatenate([ref, mask, angles], axis=0)
 
     elif num_channels == 16:
         if allow_synthetic or settings.ALLOW_SYNTHETIC_ANGLES:
-            logger.warning(
-                f"Frame {frame_idx}: 16 channels detected (12 reflectance + 4 angles). "
-                f"Synthesizing all-valid mask (1.0) for channel 12."
-            )
-            # Insert valid mask = 1.0 at index 12
-            ref = data[0:12]
-            mask = np.ones((1, height, width), dtype=np.float32)
-            angles = data[12:16]
+            ref = normalize_reflectance(raw_data[0:12])
+            mask = np.ones((1, H, W), dtype=np.float32)
+            angles_raw = raw_data[12:16]
+            angles = normalize_angles(angles_raw[0:1], angles_raw[1:2], angles_raw[2:3], angles_raw[3:4])
             channels_17 = np.concatenate([ref, mask, angles], axis=0)
         else:
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": "Missing valid/cloud mask channel",
-                    "message": (
-                        f"Frame {frame_idx} has 16 channels. MFSR requires 17 channels: "
-                        f"12 reflectance bands (0-11), 1 valid/cloud mask (12), "
-                        f"and 4 solar/view angle channels (13-16). "
-                        f"Channel 12 (valid/cloud mask) is missing."
-                    ),
+                    "message": f"Frame {frame_idx} has 16 channels. MFSR requires 17 channels.",
                     "frame_index": frame_idx,
                     "received_channels": num_channels,
                     "expected_channels": EXPECTED_NUM_CHANNELS,
                 },
             )
 
-    elif num_channels == 12 or num_channels == 13:
+    elif num_channels in (12, 13):
         if allow_synthetic or settings.ALLOW_SYNTHETIC_ANGLES:
-            logger.warning(
-                f"Frame {frame_idx}: {num_channels} channels detected. "
-                f"Synthesizing auxiliary mask and neutral angle channels (Sun Zenith 30°, Sun Azimuth 120°, View Zenith 0°, View Azimuth 0°)."
-            )
-            ref = data[0:12]
+            ref = normalize_reflectance(raw_data[0:12])
             if num_channels == 13:
-                mask = data[12:13]
+                mask = process_validity_mask(datamask=raw_data[12:13], target_hw=(H, W))
             else:
-                mask = np.ones((1, height, width), dtype=np.float32)
-            # Neutral angles: typical solar zenith 30 deg, azimuth 120 deg, nadir sensor (0 deg)
-            sun_zenith = np.full((1, height, width), 30.0, dtype=np.float32)
-            sun_azimuth = np.full((1, height, width), 120.0, dtype=np.float32)
-            view_zenith = np.zeros((1, height, width), dtype=np.float32)
-            view_azimuth = np.zeros((1, height, width), dtype=np.float32)
-            angles = np.concatenate([sun_zenith, sun_azimuth, view_zenith, view_azimuth], axis=0)
+                mask = np.ones((1, H, W), dtype=np.float32)
+
+            sun_az = np.full((1, H, W), 0.5, dtype=np.float32)
+            sun_zen = np.full((1, H, W), 0.5, dtype=np.float32)
+            view_az = np.full((1, H, W), 0.5, dtype=np.float32)
+            view_zen = np.full((1, H, W), 0.5, dtype=np.float32)
+            angles = np.concatenate([sun_az, sun_zen, view_az, view_zen], axis=0)
+
             channels_17 = np.concatenate([ref, mask, angles], axis=0)
         else:
-            missing_info = "4 solar/viewing angle channels (Sun Zenith, Sun Azimuth, View Zenith, View Azimuth)"
-            if num_channels == 12:
-                missing_info = "1 valid/cloud mask channel and " + missing_info
-
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": "Incomplete satellite image channels",
-                    "message": (
-                        f"Frame {frame_idx} has {num_channels} channels. MFSR expects 17 channels: "
-                        f"12 Sentinel-2 surface reflectance bands (0-11), "
-                        f"1 valid/cloud mask (12), and 4 solar/view angle channels (13-16). "
-                        f"Missing: {missing_info}."
-                    ),
+                    "message": f"Frame {frame_idx} has {num_channels} channels. MFSR expects 17 channels.",
                     "frame_index": frame_idx,
                     "received_channels": num_channels,
                     "expected_channels": EXPECTED_NUM_CHANNELS,
@@ -134,73 +242,71 @@ def process_single_frame(
             status_code=400,
             detail={
                 "error": "Invalid channel count",
-                "message": (
-                    f"Frame {frame_idx} contains {num_channels} channels, which is incompatible with MFSR. "
-                    f"Expected exactly 17 channels: 12 Sentinel-2 reflectance bands, "
-                    f"1 cloud/valid mask, and 4 solar/viewing angle channels."
-                ),
+                "message": f"Frame {frame_idx} contains {num_channels} channels. Expected 17.",
                 "frame_index": frame_idx,
                 "received_channels": num_channels,
                 "expected_channels": EXPECTED_NUM_CHANNELS,
             },
         )
 
-    # ------------------------------------------------------------------
-    # Normalization (Exact match to training pipeline)
-    # Sentinel-2 raw L2A reflectance is 16-bit integer (scaled by 10000.0)
-    # If max reflectance > 1.0, divide reflectance bands (0..11) by 10000.0
-    # ------------------------------------------------------------------
-    ref_bands = channels_17[0:12]
-    max_ref = float(ref_bands.max())
-    if max_ref > 1.0:
-        channels_17[0:12] = np.clip(ref_bands / settings.NORMALIZE_DIVISOR, 0.0, 1.0)
-    else:
-        channels_17[0:12] = np.clip(ref_bands, 0.0, 1.0)
-
-    # Valid mask (channel 12): ensure valid pixel representation
-    mask_band = channels_17[12:13]
-    if mask_band.max() > 1.0:
-        # Non-normalized mask (e.g. 0 or 255)
-        channels_17[12:13] = (mask_band > 0).astype(np.float32)
-    else:
-        # Already in [0, 1]
-        channels_17[12:13] = np.clip(mask_band, 0.0, 1.0)
-
     return channels_17.astype(np.float32)
 
 
 def preprocess_temporal_tiffs(
     tiff_paths: List[str],
-    allow_synthetic: bool = False,
+    allow_synthetic: bool = True,
 ) -> Tuple[torch.Tensor, GeospatialMetadata, dict[str, Any]]:
-    """
-    Validates and preprocesses 8 temporal GeoTIFF files into an MFSR input tensor.
+    ws_regex = re.compile(r'-(CLM|CLP|L2A_data|dataMask|sunAzimuthAngles|sunZenithAngles|viewAzimuthMean|viewZenithMean)\.(?:tiff|tif)$', re.IGNORECASE)
+    is_worldstrat_split = any(ws_regex.search(os.path.basename(p)) for p in tiff_paths)
 
-    Args:
-        tiff_paths: List of 8 paths to the temporal GeoTIFFs
-        allow_synthetic: If True, permits fallback angle/mask generation for testing
+    if is_worldstrat_split:
+        grouped_frames = group_files_by_frame(tiff_paths)
+        if len(grouped_frames) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "No valid frames found", "message": "No valid L2A frames found in uploaded files."},
+            )
 
-    Returns:
-        tensor: PyTorch tensor of shape [1, 8, 17, H, W] on CPU
-        ref_geospatial: GeospatialMetadata object of reference frame 1
-        debug_info: Processing summary dict
-    """
+        temporal_frames = []
+        ref_metadata = None
+        for idx, frame_info in enumerate(grouped_frames[:8], start=1):
+            if ref_metadata is None:
+                ref_metadata = read_geospatial_metadata(frame_info['L2A'])
+            frame_tensor = process_single_frame(frame_info, frame_idx=idx, allow_synthetic=allow_synthetic)
+            temporal_frames.append(frame_tensor)
+
+        _, H, W = temporal_frames[0].shape
+        while len(temporal_frames) < 8:
+            blank_frame = np.zeros((EXPECTED_NUM_CHANNELS, H, W), dtype=np.float32)
+            temporal_frames.append(blank_frame)
+
+        stacked_np = np.stack(temporal_frames, axis=0)
+        input_tensor = torch.from_numpy(stacked_np).unsqueeze(0).float()
+
+        debug_info = {
+            "num_frames": 8,
+            "detected_valid_frames": len(grouped_frames),
+            "input_tensor_shape": list(input_tensor.shape),
+            "spatial_dimensions": {"height": H, "width": W},
+            "crs": str(ref_metadata.crs) if ref_metadata else None,
+            "channel_ordering": ALL_17_CHANNEL_NAMES,
+        }
+        return input_tensor, ref_metadata, debug_info
+
     if len(tiff_paths) != 8:
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "Invalid frame count",
                 "message": f"Expected exactly 8 temporal frames, received {len(tiff_paths)}.",
+                "required_count": 8,
+                "received_count": len(tiff_paths),
             },
         )
 
-    # Validate spatial consistency across all 8 frames
     (height, width), crs_str = validate_spatial_consistency(tiff_paths)
-
-    # Read reference geospatial metadata from frame 1
     ref_metadata = read_geospatial_metadata(tiff_paths[0])
 
-    # Process all 8 frames
     frames_list = []
     for idx, path in enumerate(tiff_paths, start=1):
         frame_17ch = process_single_frame(
@@ -210,10 +316,7 @@ def preprocess_temporal_tiffs(
         )
         frames_list.append(frame_17ch)
 
-    # Stack along temporal dimension T=8: [8, 17, H, W]
     stacked_np = np.stack(frames_list, axis=0)
-
-    # Convert to PyTorch tensor and add batch dimension B=1: [1, 8, 17, H, W]
     input_tensor = torch.from_numpy(stacked_np).unsqueeze(0).float()
 
     debug_info = {
